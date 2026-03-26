@@ -20,8 +20,8 @@ def generate(params):
 
     return f"""
 from jqdata import *
-
 import pandas as pd
+import datetime
 
 
 def _order_target_percent(context, security, percent):
@@ -37,32 +37,55 @@ def _order_target_percent(context, security, percent):
 
 
 def _order_target_zero(context, security):
-    if "order_target" in globals():
-        return order_target(security, 0)
-    if "order_target_value" in globals():
-        return order_target_value(security, 0)
-    if hasattr(context, "order_target"):
-        return context.order_target(security, 0)
-    if hasattr(context, "order_target_value"):
-        return context.order_target_value(security, 0)
-    raise NameError("order_target is not defined in this environment")
+    return _order_target_percent(context, security, 0)
 
 
+# =========================
+# 股票池过滤（增强版）
+# =========================
 def _stock_pool(context):
     current_data = get_current_data()
     securities = get_all_securities("stock", date=context.previous_date)
+
     if securities is None or securities.empty:
         return []
 
-    return [
-        stock
-        for stock in securities.index
-        if not current_data[stock].paused
-        and not current_data[stock].is_st
-        and "ST" not in current_data[stock].name
-    ]
+    today = context.current_dt.date()
+    pool = []
+
+    for stock in securities.index:
+
+        data = current_data[stock]
+
+        # 停牌
+        if data.paused:
+            continue
+
+        # ST
+        if data.is_st or "ST" in data.name or "*" in data.name:
+            continue
+
+        # 次新股（<60天）
+        listed_days = (today - securities.loc[stock].start_date).days
+        if listed_days < 60:
+            continue
+
+        # 涨跌停过滤（避免买不到/卖不掉）
+        if data.high_limit == data.low_limit:
+            continue
+        if data.last_price >= data.high_limit * 0.99:
+            continue
+        if data.last_price <= data.low_limit * 1.01:
+            continue
+
+        pool.append(stock)
+
+    return pool
 
 
+# =========================
+# 因子评分（防未来函数）
+# =========================
 def _score_candidates(context, candidates):
     if not candidates:
         return pd.DataFrame()
@@ -83,22 +106,28 @@ def _score_candidates(context, candidates):
         return pd.DataFrame()
 
     df = fundamentals.dropna().copy()
-    if df.empty:
-        return df
 
-    df = df[(df["pe_ratio"] > 0) & (df["pb_ratio"] > 0) & (df["total_assets"] > 0)]
+    df = df[
+        (df["pe_ratio"] > 0)
+        & (df["pb_ratio"] > 0)
+        & (df["total_assets"] > 0)
+    ]
+
     if df.empty:
         return df
 
     df["debt_ratio"] = df["total_liability"] / df["total_assets"]
-    pe_cap = df["pe_ratio"].mean() * 1.5
-    pb_cap = min(df["pb_ratio"].mean() * 1.5, 2.0)
+
+    # 去极值（更稳）
+    pe_cap = df["pe_ratio"].quantile(0.8)
+    pb_cap = df["pb_ratio"].quantile(0.8)
 
     df = df[
         (df["pe_ratio"] < pe_cap)
         & (df["pb_ratio"] < pb_cap)
         & (df["debt_ratio"] < 0.8)
     ]
+
     if df.empty:
         return df
 
@@ -108,12 +137,17 @@ def _score_candidates(context, candidates):
         + df["roe"].rank(pct=True)
         + (1 - df["debt_ratio"]).rank(pct=True)
     )
+
     return df.sort_values("score", ascending=False)
 
 
+# =========================
+# 调仓
+# =========================
 def rebalance(context):
     candidates = _stock_pool(context)
     ranked = _score_candidates(context, candidates)
+
     if ranked.empty:
         return
 
@@ -121,6 +155,7 @@ def rebalance(context):
     current_positions = list(context.portfolio.positions.keys())
     target_set = set(targets)
 
+    # 先卖
     for stock in current_positions:
         if stock not in target_set:
             _order_target_zero(context, stock)
@@ -128,6 +163,7 @@ def rebalance(context):
     if not targets:
         return
 
+    # 再买
     weight = 1.0 / len(targets)
     for stock in targets:
         _order_target_percent(context, stock, weight)
@@ -136,5 +172,6 @@ def rebalance(context):
 def initialize(context):
     set_benchmark("000852.XSHG")
     set_option("use_real_price", True)
+
     run_monthly(rebalance, monthday={rebalance_period_days}, time="09:35")
 """
